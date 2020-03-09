@@ -126,6 +126,12 @@ class DataProcessor(object):
         with open(input_file, "r", encoding="utf-8-sig") as f:
             return list(csv.reader(f, delimiter="\t", quotechar=quotechar))
 
+    @classmethod
+    def _read_jsonl(cls, input_file, quotechar=None):
+        """Reads a tab separated value file."""
+        with open(input_file, "r", encoding="utf-8-sig") as f:
+            return [json.loads(l) for l in f]
+
 
 class SingleSentenceClassificationProcessor(DataProcessor):
     """ Generic processor for a single sentence classification data set."""

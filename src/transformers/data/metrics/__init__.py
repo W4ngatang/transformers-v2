@@ -32,9 +32,9 @@ if _has_sklearn:
     def simple_accuracy(preds, labels):
         return (preds == labels).mean()
 
-    def acc_and_f1(preds, labels):
+    def acc_and_f1(preds, labels, f1_avg="binary"):
         acc = simple_accuracy(preds, labels)
-        f1 = f1_score(y_true=labels, y_pred=preds)
+        f1 = f1_score(y_true=labels, y_pred=preds, average=f1_avg)
         return {
             "acc": acc,
             "f1": f1,
@@ -74,6 +74,27 @@ if _has_sklearn:
             return {"acc": simple_accuracy(preds, labels)}
         elif task_name == "hans":
             return {"acc": simple_accuracy(preds, labels)}
+        else:
+            raise KeyError(task_name)
+
+    def superglue_compute_metrics(task_name, preds, labels):
+        assert len(preds) == len(labels)
+        if task_name == "boolq":
+            return {"acc": simple_accuracy(preds, labels)}
+        elif task_name == "cb":
+            return acc_and_f1(preds, labels, f1_avg="macro")
+        elif task_name == "copa":
+            return {"acc": simple_accuracy(preds, labels)}
+        elif task_name == "multirc":
+            raise NotImplementedError
+        elif task_name == "record":
+            raise NotImplementedError
+        elif task_name == "rte":
+            return {"acc": simple_accuracy(preds, labels)}
+        elif task_name == "wic":
+            return {"acc": simple_accuracy(preds, labels)}
+        elif task_name == "wsc":
+            return acc_and_f1(preds, labels)
         else:
             raise KeyError(task_name)
 
