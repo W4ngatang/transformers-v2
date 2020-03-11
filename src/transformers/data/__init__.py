@@ -20,6 +20,7 @@ from .processors import (
     superglue_output_modes,
     superglue_processors,
     superglue_tasks_num_labels,
+    superglue_tasks_num_spans,
     squad_convert_examples_to_features,
     xnli_output_modes,
     xnli_processors,

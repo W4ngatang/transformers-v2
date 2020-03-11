@@ -500,7 +500,6 @@ class WicProcessor(DataProcessor):
 
 class WscProcessor(DataProcessor):
     """Processor for the STS-B data set (GLUE version)."""
-    # TODO(AW)
 
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
@@ -517,21 +516,26 @@ class WscProcessor(DataProcessor):
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "dev.jsonl")), "dev")
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "val.jsonl")), "dev")
 
     def get_labels(self):
         """See base class."""
-        return [None]
+        return [True, False]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line[0])
-            text_a = line[7]
-            text_b = line[8]
-            label = line[-1]
-            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            guid = "%s-%s" % (set_type, line["idx"])
+            text_a = line["text"]
+            span_start1 = line["target"]["span1_index"]
+            span_start2 = line["target"]["span2_index"]
+            span_end1 = span_start1 + len(line["target"]["span1_text"])
+            span_end2 = span_start2 + len(line["target"]["span2_text"])
+            span1 = (span_start1, span_end1)
+            span2 = (span_start2, span_end2)
+            label = line["label"]
+            examples.append(SpanClassificationExample(guid=guid, text_a=text_a, spans_a=[span1, span2], label=label))
         return examples
 
 
@@ -540,6 +544,11 @@ superglue_tasks_num_labels = {
     "cb": 3,
     "copa": 2,
     "rte": 2,
+    "wic": 2,
+    "wsc": 2,
+}
+
+superglue_tasks_num_spans = {
     "wic": 2,
     "wsc": 2,
 }

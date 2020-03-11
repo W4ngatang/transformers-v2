@@ -61,6 +61,7 @@ from transformers import (
 )
 from transformers import superglue_compute_metrics as compute_metrics
 from transformers import superglue_convert_examples_to_features as convert_examples_to_features
+from transformers import superglue_tasks_num_labels as task_spans
 from transformers import superglue_output_modes as output_modes
 from transformers import superglue_processors as processors
 
@@ -645,6 +646,8 @@ def main():
         finetuning_task=args.task_name,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
+    if args.output_mode == "span_classification":
+        config.num_spans = task_spans[args.task_name]
     tokenizer = tokenizer_class.from_pretrained(
         args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
         do_lower_case=args.do_lower_case,
