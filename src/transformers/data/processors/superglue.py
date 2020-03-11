@@ -20,13 +20,55 @@ import logging
 import os
 
 from ...file_utils import is_tf_available
-from .utils import DataProcessor, InputExample, InputFeatures
+from .utils import DataProcessor, InputExample, InputFeatures, SpanClassificationExample, SpanClassificationFeatures
 
 
 if is_tf_available():
     import tensorflow as tf
 
 logger = logging.getLogger(__name__)
+
+
+def tokenize_tracking_span(tokenizer, text, spans):
+    """
+    Tokenize while tracking what tokens spans (char idxs) get mapped to
+    Strategy: split input around span, tokenize left of span, the span,
+        and then recursively apply to remaning text + spans
+    We assume spans are
+        - inclusive on start and end
+        - non-overlapping (TODO)
+        - sorted (TODO)
+
+    Args:
+
+    Returns:
+
+    """
+    toks = tokenizer.encode_plus(text)
+    full_toks = toks["input_ids"]
+    prefix_len = len(tokenizer.decode(full_toks[:1])) + 1 # add a space
+    len_covers = []
+    for i in range(2, len(full_toks)):
+        # iterate over the tokens and decode the length of the sequence
+        # we start at 2 b/c 0 is empty; 1 is CLS/SOS
+        partial_txt_len = len(tokenizer.decode(full_toks[:i], clean_up_tokenization_spaces=False))
+        len_covers.append(partial_txt_len - prefix_len)
+
+    span_locs = []
+    for start, end in spans:
+        start_tok, end_tok = None, None
+        for tok_n, len_cover in enumerate(len_covers):
+            if len_cover >= start and start_tok is None:
+                start_tok = tok_n + 1 # account for [CLS] tok
+            if len_cover >= end:
+                assert start_tok is not None
+                end_tok = tok_n + 1
+                break
+        assert start_tok is not None, "start_tok is None!"
+        assert end_tok is not None, "end_tok is None!"
+        span_locs.append((start_tok, end_tok))
+
+    return toks, span_locs
 
 
 def superglue_convert_examples_to_features(
@@ -91,8 +133,27 @@ def superglue_convert_examples_to_features(
         if ex_index % 10000 == 0:
             logger.info("Writing example %d/%d" % (ex_index, len_examples))
 
-        inputs = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=max_length,)
-        input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
+        if isinstance(example, SpanClassificationExample):
+            inputs_a, span_locs_a = tokenize_tracking_span(tokenizer, example.text_a, example.spans_a)
+            if example.spans_b is not None:
+                inputs_b, span_locs_b = tokenize_tracking_span(tokenizer, example.text_b, example.spans_b)
+
+                input_ids = inputs_a["input_ids"] + inputs_b["input_ids"][1:]
+                token_type_ids = inputs_a["token_type_ids"] + ([1] * len(inputs_b["token_type_ids"][1:]))
+                offset = len(inputs_a["input_ids"]) - 1
+                span_locs_b = [(s + offset, e + offset) for s, e in span_locs_b]
+                span_locs = span_locs_a + span_locs_b
+
+                tmp = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=max_length,)
+                assert tmp["input_ids"] == input_ids, "Span tracking tokenization produced inconsistent result!"
+                assert tmp["token_type_ids"] == token_type_ids, "Span tracking tokenization produced inconsistent result!"
+            else:
+                input_ids, token_type_ids = inputs_a["input_ids"], inputs_a["token_type_ids"]
+                span_locs = span_locs_a
+
+        else:
+            inputs = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=max_length,)
+            input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
 
         # The mask has 1 for real tokens and 0 for padding tokens. Only real
         # tokens are attended to.
@@ -101,9 +162,12 @@ def superglue_convert_examples_to_features(
         # Zero-pad up to the sequence length.
         padding_length = max_length - len(input_ids)
         if pad_on_left:
+            # TODO(AW): will fuck up span tracking
+            assert False, "Not implemented correctly wrt span tracking!"
             input_ids = ([pad_token] * padding_length) + input_ids
             attention_mask = ([0 if mask_padding_with_zero else 1] * padding_length) + attention_mask
             token_type_ids = ([pad_token_segment_id] * padding_length) + token_type_ids
+
         else:
             input_ids = input_ids + ([pad_token] * padding_length)
             attention_mask = attention_mask + ([0 if mask_padding_with_zero else 1] * padding_length)
@@ -116,8 +180,7 @@ def superglue_convert_examples_to_features(
         assert len(token_type_ids) == max_length, "Error with input length {} vs {}".format(
             len(token_type_ids), max_length
         )
-
-        if output_mode == "classification":
+        if output_mode in ["classification", "span_classification"]:
             label = label_map[example.label]
         elif output_mode == "regression":
             label = float(example.label)
@@ -132,13 +195,22 @@ def superglue_convert_examples_to_features(
             logger.info("token_type_ids: %s" % " ".join([str(x) for x in token_type_ids]))
             logger.info("label: %s (id = %d)" % (example.label, label))
 
-        features.append(
-            InputFeatures(
-                input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, label=label
-            )
-        )
+        if isinstance(example, SpanClassificationExample):
+            feats = SpanClassificationFeatures(input_ids=input_ids,
+                                               span_locs=span_locs,
+                                               attention_mask=attention_mask,
+                                               token_type_ids=token_type_ids,
+                                               label=label)
+        else:
+            feats = InputFeatures(input_ids=input_ids,
+                                  attention_mask=attention_mask,
+                                  token_type_ids=token_type_ids,
+                                  label=label)
+
+        features.append(feats)
 
     if is_tf_available() and is_tf_dataset:
+        # TODO(AW): include span classification version
 
         def gen():
             for ex in features:
@@ -231,8 +303,6 @@ class CbProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "%s-%s" % (set_type, line["idx"])
             text_a = line["premise"]
             text_b = line["hypothesis"]
@@ -270,8 +340,6 @@ class CopaProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "%s-%s" % (set_type, line[0])
             text_a = line[1]
             text_b = line[2]
@@ -309,8 +377,6 @@ class MultircProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "%s-%s" % (set_type, line[0])
             text_a = line[1]
             text_b = line[2]
@@ -348,8 +414,6 @@ class RecordProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "%s-%s" % (set_type, line[0])
             text_a = line[1]
             text_b = line[2]
@@ -386,8 +450,6 @@ class RteProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "%s-%s" % (set_type, line["idx"])
             text_a = line["premise"]
             text_b = line["hypothesis"]
@@ -397,7 +459,7 @@ class RteProcessor(DataProcessor):
 
 
 class WicProcessor(DataProcessor):
-    """Processor for the STS-B data set (GLUE version)."""
+    """Processor for the WiC data set (SuperGLUE version)."""
     # TODO(AW)
 
     def get_example_from_tensor_dict(self, tensor_dict):
@@ -415,23 +477,24 @@ class WicProcessor(DataProcessor):
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "dev.jsonl")), "dev")
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "val.jsonl")), "dev")
 
     def get_labels(self):
         """See base class."""
-        return [None]
+        return [True, False]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
-            guid = "%s-%s" % (set_type, line[0])
-            text_a = line[7]
-            text_b = line[8]
-            label = line[-1]
-            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            guid = "%s-%s" % (set_type, line["idx"])
+            text_a = line["sentence1"]
+            text_b = line["sentence2"]
+            span_a = (line["start1"], line["end1"])
+            span_b = (line["start2"], line["end2"])
+            label = line["label"]
+            examples.append(SpanClassificationExample(guid=guid, text_a=text_a, spans_a=[span_a],
+                                                      text_b=text_b, spans_b=[span_b], label=label))
         return examples
 
 
@@ -464,8 +527,6 @@ class WscProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
             guid = "%s-%s" % (set_type, line[0])
             text_a = line[7]
             text_b = line[8]
@@ -501,6 +562,6 @@ superglue_output_modes = {
     "multirc": "TODO",
     "record": "TODO",
     "rte": "classification",
-    "wic": "classification",
-    "wsc": "classification",
+    "wic": "span_classification",
+    "wsc": "span_classification",
 }

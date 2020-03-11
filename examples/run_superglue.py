@@ -37,6 +37,7 @@ from transformers import (
     AlbertTokenizer,
     BertConfig,
     BertForSequenceClassification,
+    BertForSpanClassification,
     BertTokenizer,
     DistilBertConfig,
     DistilBertForSequenceClassification,
@@ -90,14 +91,17 @@ ALL_MODELS = sum(
 )
 
 MODEL_CLASSES = {
-    "bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
-    "xlnet": (XLNetConfig, XLNetForSequenceClassification, XLNetTokenizer),
-    "xlm": (XLMConfig, XLMForSequenceClassification, XLMTokenizer),
-    "roberta": (RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer),
-    "distilbert": (DistilBertConfig, DistilBertForSequenceClassification, DistilBertTokenizer),
-    "albert": (AlbertConfig, AlbertForSequenceClassification, AlbertTokenizer),
-    "xlmroberta": (XLMRobertaConfig, XLMRobertaForSequenceClassification, XLMRobertaTokenizer),
-    "flaubert": (FlaubertConfig, FlaubertForSequenceClassification, FlaubertTokenizer),
+    #"bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
+    #"xlnet": (XLNetConfig, XLNetForSequenceClassification, XLNetTokenizer),
+    #"xlm": (XLMConfig, XLMForSequenceClassification, XLMTokenizer),
+    #"roberta": (RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer),
+    #"distilbert": (DistilBertConfig, DistilBertForSequenceClassification, DistilBertTokenizer),
+    #"albert": (AlbertConfig, AlbertForSequenceClassification, AlbertTokenizer),
+    #"xlmroberta": (XLMRobertaConfig, XLMRobertaForSequenceClassification, XLMRobertaTokenizer),
+    #"flaubert": (FlaubertConfig, FlaubertForSequenceClassification, FlaubertTokenizer),
+
+    "bert": (BertConfig, BertTokenizer, {"classification": BertForSequenceClassification, "span_classification": BertForSpanClassification}),
+    #"roberta": (RobertaConfig, RobertaTokenizer, {"classification": RobertaForSequenceClassification, "span_classification": RobertaForSpanClassification}),
 }
 
 
@@ -214,6 +218,8 @@ def train(args, train_dataset, model, tokenizer):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+            if args.output_mode == "span_classification":
+                inputs["spans"] = batch[4]
             if args.model_type != "distilbert":
                 inputs["token_type_ids"] = (
                     batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
@@ -330,6 +336,8 @@ def evaluate(args, model, tokenizer, prefix=""):
 
             with torch.no_grad():
                 inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+                if args.output_mode == "span_classification":
+                    inputs["spans"] = batch[4]
                 if args.model_type != "distilbert":
                     inputs["token_type_ids"] = (
                         batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
@@ -347,7 +355,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                 out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
 
         eval_loss = eval_loss / nb_eval_steps
-        if args.output_mode == "classification":
+        if args.output_mode in ["classification", "span_classification"]:
             preds = np.argmax(preds, axis=1)
         elif args.output_mode == "regression":
             preds = np.squeeze(preds)
@@ -413,12 +421,18 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
     all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
-    if output_mode == "classification":
+    if output_mode in ["classification", "span_classification"]:
         all_labels = torch.tensor([f.label for f in features], dtype=torch.long)
     elif output_mode == "regression":
         all_labels = torch.tensor([f.label for f in features], dtype=torch.float)
 
-    dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
+    if output_mode in ["span_classification"]:
+        #all_starts = torch.tensor([[s[0] for s in f.span_locs] for f in features], dtype=torch.long)
+        #all_ends = torch.tensor([[s[1] for s in f.span_locs] for f in features], dtype=torch.long)
+        all_spans = torch.tensor([f.span_locs for f in features])
+        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_spans)
+    else:
+        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
     return dataset
 
 
@@ -549,6 +563,7 @@ def main():
         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
         "See details at https://nvidia.github.io/apex/amp.html",
     )
+    parser.add_argument("--use_gpuid", type=int, default=-1, help="Use a specific GPU only")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
@@ -576,7 +591,10 @@ def main():
         ptvsd.wait_for_attach()
 
     # Setup CUDA, GPU & distributed training
-    if args.local_rank == -1 or args.no_cuda:
+    if args.use_gpuid > -1:
+        device = args.use_gpuid
+        args.n_gpu = 1
+    elif args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
@@ -618,7 +636,9 @@ def main():
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     args.model_type = args.model_type.lower()
-    config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    #config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    config_class, tokenizer_class, model_classes = MODEL_CLASSES[args.model_type]
+    model_class = model_classes[args.output_mode]
     config = config_class.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
         num_labels=num_labels,
