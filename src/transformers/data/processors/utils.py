@@ -101,6 +101,7 @@ class InputFeatures(object):
     A single set of features of data.
 
     Args:
+        guid: Example ID, as a list of ints
         input_ids: Indices of input sequence tokens in the vocabulary.
         attention_mask: Mask to avoid performing attention on padding token indices.
             Mask values selected in ``[0, 1]``:
@@ -109,7 +110,8 @@ class InputFeatures(object):
         label: Label corresponding to the input
     """
 
-    def __init__(self, input_ids, attention_mask=None, token_type_ids=None, label=None):
+    def __init__(self, guid, input_ids, attention_mask=None, token_type_ids=None, label=None):
+        self.guid = guid
         self.input_ids = input_ids
         self.attention_mask = attention_mask
         self.token_type_ids = token_type_ids
@@ -133,6 +135,7 @@ class SpanClassificationFeatures(object):
     A single set of features of data.
 
     Args:
+        guid: Example ID, as a list of ints
         input_ids: Indices of input sequence tokens in the vocabulary.
         attention_mask: Mask to avoid performing attention on padding token indices.
             Mask values selected in ``[0, 1]``:
@@ -141,7 +144,8 @@ class SpanClassificationFeatures(object):
         label: Label corresponding to the input
     """
 
-    def __init__(self, input_ids, span_locs, attention_mask=None, token_type_ids=None, label=None):
+    def __init__(self, guid, input_ids, span_locs, attention_mask=None, token_type_ids=None, label=None):
+        self.guid = guid
         self.input_ids = input_ids
         self.span_locs = span_locs
         self.attention_mask = attention_mask

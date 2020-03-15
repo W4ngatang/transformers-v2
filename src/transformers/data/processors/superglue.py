@@ -190,19 +190,22 @@ def superglue_convert_examples_to_features(
         if ex_index < 5:
             logger.info("*** Example ***")
             logger.info("guid: %s" % (example.guid))
+            logger.info("input text: %s" % tokenizer.decode(input_ids, clean_up_tokenization_spaces=False))
             logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
             logger.info("attention_mask: %s" % " ".join([str(x) for x in attention_mask]))
             logger.info("token_type_ids: %s" % " ".join([str(x) for x in token_type_ids]))
             logger.info("label: %s (id = %d)" % (example.label, label))
 
         if isinstance(example, SpanClassificationExample):
-            feats = SpanClassificationFeatures(input_ids=input_ids,
+            feats = SpanClassificationFeatures(guid=example.guid,
+                                               input_ids=input_ids,
                                                span_locs=span_locs,
                                                attention_mask=attention_mask,
                                                token_type_ids=token_type_ids,
                                                label=label)
         else:
-            feats = InputFeatures(input_ids=input_ids,
+            feats = InputFeatures(guid=example.guid,
+                                  input_ids=input_ids,
                                   attention_mask=attention_mask,
                                   token_type_ids=token_type_ids,
                                   label=label)
@@ -216,6 +219,7 @@ def superglue_convert_examples_to_features(
             for ex in features:
                 yield (
                     {
+                        "guid": ex.guid,
                         "input_ids": ex.input_ids,
                         "attention_mask": ex.attention_mask,
                         "token_type_ids": ex.token_type_ids,
@@ -228,6 +232,7 @@ def superglue_convert_examples_to_features(
             ({"input_ids": tf.int32, "attention_mask": tf.int32, "token_type_ids": tf.int32}, tf.int64),
             (
                 {
+                    "guid": ex.guid,
                     "input_ids": tf.TensorShape([None]),
                     "attention_mask": tf.TensorShape([None]),
                     "token_type_ids": tf.TensorShape([None]),
@@ -367,27 +372,43 @@ class MultircProcessor(DataProcessor):
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "dev.jsonl")), "dev_matched")
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "val.jsonl")), "dev")
 
     def get_labels(self):
         """See base class."""
-        return ["entailment", "not_entailment"]
+        return [0, 1]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
+        # NOTE(Alex): currently concatenating passage and question,
+        # which might lead to the question getting cut off. An
+        # alternative is to concatenate question and answer, but that
+        # feels like there's a missing [SEP] token. Maybe the robust
+        # solution is to use [SEP] tokens between everything.
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line[0])
-            text_a = line[1]
-            text_b = line[2]
-            label = line[-1]
-            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            passage_id = line["idx"]
+            passage = line["passage"]["text"]
+            for question_dict in line["passage"]["questions"]:
+                question_id = question_dict["idx"]
+                question = question_dict["question"]
+                passage_and_question = " ".join([passage, question])
+                for answer_dict in question_dict["answers"]:
+                    answer_id = answer_dict["idx"]
+                    #guid = "%s-%s-%s-%s" % (set_type, passage_id, question_id, answer_id)
+                    guid = [passage_id, question_id, answer_id]
+                    answer = answer_dict["text"]
+                    label = answer_dict["label"]
+                    examples.append(InputExample(guid=guid, text_a=passage_and_question, text_b=answer, label=label))
         return examples
 
 
 class RecordProcessor(DataProcessor):
     """Processor for the ReCoRD data set (SuperGLUE version)."""
     # TODO(AW)
+
+    def __init__(self):
+        self._answers = None
 
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
@@ -404,21 +425,57 @@ class RecordProcessor(DataProcessor):
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "dev.jsonl")), "dev_matched")
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "val.jsonl")), "dev")
 
     def get_labels(self):
         """See base class."""
-        return ["entailment", "not_entailment"]
+        return [0, 1]
+
+    def get_answers(self, data_dir, set_type):
+        """ """
+        if self._answers is None or set_type not in self._answers:
+            self._answers = {set_type: {}}
+            data_file = "val.jsonl" if set_type == "dev" else "train.jsonl"
+            data = self._read_jsonl(os.path.join(data_dir, data_file))
+            for (i, line) in enumerate(data[:10]):
+                passage_id = line["idx"]
+                passage = line["passage"]["text"]
+
+                ents = []
+                for ent_dict in line["passage"]["entities"]:
+                    ents.append(passage[ent_dict["start"]: ent_dict["end"] + 1])
+                for question_dict in line["qas"]:
+                    question_id = question_dict["idx"]
+                    # TODO(AW): no answer case
+                    answers = [a["text"] for a in question_dict["answers"]]
+                    self._answers[set_type][(passage_id, question_id)] = (ents, answers)
+
+        return self._answers[set_type]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
-        for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line[0])
-            text_a = line[1]
-            text_b = line[2]
-            label = line[-1]
-            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+        qst2ans = {}
+        for (i, line) in enumerate(lines[:10]):
+            passage_id = line["idx"]
+            passage = line["passage"]["text"]
+
+            ents = []
+            for ent_dict in line["passage"]["entities"]:
+                ents.append(passage[ent_dict["start"]: ent_dict["end"] + 1])
+
+            for question_dict in line["qas"]:
+                question_id = question_dict["idx"]
+                question_template = question_dict["query"]
+                # TODO(AW): no answer case
+                answers = [a["text"] for a in question_dict["answers"]]
+                qst2ans[(passage_id, question_id)] = answers
+
+                for ent_id, ent in enumerate(ents):
+                    label = 1 if ent in answers else 0
+                    candidate = question_template.replace("@placeholder", ent)
+                    guid = [passage_id, question_id, ent_id]
+                    examples.append(InputExample(guid=guid, text_a=passage, text_b=candidate, label=label))
         return examples
 
 
@@ -568,8 +625,8 @@ superglue_output_modes = {
     "boolq": "classification",
     "cb": "classification",
     "copa": "classification",
-    "multirc": "TODO",
-    "record": "TODO",
+    "multirc": "classification",
+    "record": "classification",
     "rte": "classification",
     "wic": "span_classification",
     "wsc": "span_classification",

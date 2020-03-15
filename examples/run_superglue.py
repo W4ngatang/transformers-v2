@@ -28,6 +28,7 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
+import ipdb
 
 from transformers import (
     WEIGHTS_NAME,
@@ -309,7 +310,11 @@ def evaluate(args, model, tokenizer, prefix=""):
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
-        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+        if eval_task == "record":
+            eval_dataset, eval_answers = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+        else:
+            eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+            eval_answers = None
 
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
@@ -331,9 +336,11 @@ def evaluate(args, model, tokenizer, prefix=""):
         nb_eval_steps = 0
         preds = None
         out_label_ids = None
+        ex_ids = None
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
+            guids = batch[-1]
 
             with torch.no_grad():
                 inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
@@ -351,16 +358,19 @@ def evaluate(args, model, tokenizer, prefix=""):
             if preds is None:
                 preds = logits.detach().cpu().numpy()
                 out_label_ids = inputs["labels"].detach().cpu().numpy()
+                ex_ids = [guids.detach().cpu().numpy()]
             else:
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
+                ex_ids.append(guids.detach().cpu().numpy())
 
+        ex_ids = np.vstack(ex_ids)
         eval_loss = eval_loss / nb_eval_steps
-        if args.output_mode in ["classification", "span_classification"]:
+        if args.output_mode in ["classification", "span_classification"] and args.task_name not in ["record"]:
             preds = np.argmax(preds, axis=1)
         elif args.output_mode == "regression":
             preds = np.squeeze(preds)
-        result = compute_metrics(eval_task, preds, out_label_ids)
+        result = compute_metrics(eval_task, preds, out_label_ids, guids=ex_ids, answers=eval_answers)
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
@@ -419,6 +429,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Convert to Tensors and build dataset
+    all_guids = torch.tensor([f.guid for f in features], dtype=torch.long)
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
     all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
@@ -431,10 +442,15 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         #all_starts = torch.tensor([[s[0] for s in f.span_locs] for f in features], dtype=torch.long)
         #all_ends = torch.tensor([[s[1] for s in f.span_locs] for f in features], dtype=torch.long)
         all_spans = torch.tensor([f.span_locs for f in features])
-        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_spans)
+        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_spans, all_guids)
     else:
-        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
-    return dataset
+        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_guids)
+
+    if args.task_name == "record" and evaluate:
+        answers = processor.get_answers(args.data_dir, "dev")
+        return dataset, answers
+    else:
+        return dataset
 
 
 def main():
@@ -495,7 +511,7 @@ def main():
     )
     parser.add_argument(
         "--max_seq_length",
-        default=128,
+        default=512,
         type=int,
         help="The maximum total input sequence length after tokenization. Sequences longer "
         "than this will be truncated, sequences shorter will be padded.",
