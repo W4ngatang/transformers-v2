@@ -48,6 +48,7 @@ from transformers import (
     FlaubertTokenizer,
     RobertaConfig,
     RobertaForSequenceClassification,
+    RobertaForSpanClassification,
     RobertaTokenizer,
     XLMConfig,
     XLMForSequenceClassification,
@@ -65,6 +66,8 @@ from transformers import superglue_convert_examples_to_features as convert_examp
 from transformers import superglue_tasks_num_labels as task_spans
 from transformers import superglue_output_modes as output_modes
 from transformers import superglue_processors as processors
+
+from experiment_impact_tracker.compute_tracker import ImpactTracker
 
 
 try:
@@ -103,7 +106,7 @@ MODEL_CLASSES = {
     #"flaubert": (FlaubertConfig, FlaubertForSequenceClassification, FlaubertTokenizer),
 
     "bert": (BertConfig, BertTokenizer, {"classification": BertForSequenceClassification, "span_classification": BertForSpanClassification}),
-    #"roberta": (RobertaConfig, RobertaTokenizer, {"classification": RobertaForSequenceClassification, "span_classification": RobertaForSpanClassification}),
+    "roberta": (RobertaConfig, RobertaTokenizer, {"classification": RobertaForSequenceClassification, "span_classification": RobertaForSpanClassification}),
 }
 
 
@@ -204,12 +207,14 @@ def train(args, train_dataset, model, tokenizer):
 
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
-    train_iterator = trange(
-        epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0],
-    )
+    #train_iterator = trange(
+    #    epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0],
+    #)
+    train_iterator = range(epochs_trained, int(args.num_train_epochs))
+
     set_seed(args)  # Added here for reproductibility
-    for _ in train_iterator:
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+    for epoch_n in train_iterator:
+        epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch_n}", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
 
             # Skip past any already trained steps if resuming training
@@ -241,6 +246,7 @@ def train(args, train_dataset, model, tokenizer):
                 loss.backward()
 
             tr_loss += loss.item()
+            epoch_iterator.set_description(f"Epoch {epoch_n} loss: {loss:.3f}")
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -257,20 +263,22 @@ def train(args, train_dataset, model, tokenizer):
                     if (
                         args.local_rank == -1 and args.evaluate_during_training
                     ):  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
+                        results = evaluate(args, model, tokenizer, use_tqdm=False)
                         for key, value in results.items():
                             eval_key = "eval_{}".format(key)
                             logs[eval_key] = value
 
                     loss_scalar = (tr_loss - logging_loss) / args.logging_steps
-                    learning_rate_scalar = scheduler.get_lr()[0]
+                    learning_rate_scalar = scheduler.get_last_lr()[0]
                     logs["learning_rate"] = learning_rate_scalar
-                    logs["loss"] = loss_scalar
+                    logs["avg_loss_since_last_log"] = loss_scalar
                     logging_loss = tr_loss
 
                     for key, value in logs.items():
                         tb_writer.add_scalar(key, value, global_step)
-                    print(json.dumps({**logs, **{"step": global_step}}))
+                    #print(json.dumps({**logs, **{"step": global_step}}))
+                    logging.info(json.dumps({**logs, **{"step": global_step}}))
+
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     # Save model checkpoint
@@ -303,7 +311,7 @@ def train(args, train_dataset, model, tokenizer):
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, model, tokenizer, prefix=""):
+def evaluate(args, model, tokenizer, prefix="", use_tqdm=True):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + "-MM") if args.task_name == "mnli" else (args.output_dir,)
@@ -337,7 +345,8 @@ def evaluate(args, model, tokenizer, prefix=""):
         preds = None
         out_label_ids = None
         ex_ids = None
-        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+        eval_dataloader = tqdm(eval_dataloader, desc="Evaluating") if use_tqdm else eval_dataloader
+        for batch in eval_dataloader:
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
             guids = batch[-1]
@@ -364,12 +373,13 @@ def evaluate(args, model, tokenizer, prefix=""):
                 out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
                 ex_ids.append(guids.detach().cpu().numpy())
 
-        ex_ids = np.vstack(ex_ids)
+        ex_ids = np.concatenate(ex_ids, axis=0)
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode in ["classification", "span_classification"] and args.task_name not in ["record"]:
             preds = np.argmax(preds, axis=1)
         elif args.output_mode == "regression":
             preds = np.squeeze(preds)
+        logging.info(f"predictions: {preds}")
         result = compute_metrics(eval_task, preds, out_label_ids, guids=ex_ids, answers=eval_answers)
         results.update(result)
 
@@ -598,11 +608,23 @@ def main():
             )
         )
 
+    # Setup logging
+    logging.basicConfig(
+        #format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        format="%(asctime)s: %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
+    )
+
+    # Launch impact tracker
+    #logging.info("Launching impact tracker...")
+    #tracker = ImpactTracker(args.output_dir)
+    #tracker.launch_impact_monitor()
+
     # Setup distant debugging if needed
     if args.server_ip and args.server_port:
         # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
         import ptvsd
-
         print("Waiting for debugger attach")
         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
         ptvsd.wait_for_attach()
@@ -620,13 +642,6 @@ def main():
         torch.distributed.init_process_group(backend="nccl")
         args.n_gpu = 1
     args.device = device
-
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
-    )
     logger.warning(
         "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
         args.local_rank,
@@ -639,21 +654,21 @@ def main():
     # Set seed
     set_seed(args)
 
-    # Prepare GLUE task
+    # Prepare task
     args.task_name = args.task_name.lower()
-    if args.task_name not in processors:
-        raise ValueError("Task not found: %s" % (args.task_name))
+    assert args.task_name in processors, f"Task {args.task_name} not found!"
     processor = processors[args.task_name]()
     args.output_mode = output_modes[args.task_name]
     label_list = processor.get_labels()
     num_labels = len(label_list)
 
-    # Load pretrained model and tokenizer
+    # Do all the stuff you want only first process to do
+    # e.g. make sure only the first process will download model & vocab
     if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+        torch.distributed.barrier()
 
+    # Load pretrained model and tokenizer
     args.model_type = args.model_type.lower()
-    #config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config_class, tokenizer_class, model_classes = MODEL_CLASSES[args.model_type]
     model_class = model_classes[args.output_mode]
     config = config_class.from_pretrained(

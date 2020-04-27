@@ -50,7 +50,7 @@ def tokenize_tracking_span(tokenizer, text, spans):
     len_covers = []
     for i in range(2, len(full_toks)):
         # iterate over the tokens and decode the length of the sequence
-        # we start at 2 b/c 0 is empty; 1 is CLS/SOS
+        # we start at 2 b/c 0 is empty (indexing from end); 1 is CLS/SOS
         partial_txt_len = len(tokenizer.decode(full_toks[:i], clean_up_tokenization_spaces=False))
         len_covers.append(partial_txt_len - prefix_len)
 
@@ -137,16 +137,28 @@ def superglue_convert_examples_to_features(
             inputs_a, span_locs_a = tokenize_tracking_span(tokenizer, example.text_a, example.spans_a)
             if example.spans_b is not None:
                 inputs_b, span_locs_b = tokenize_tracking_span(tokenizer, example.text_b, example.spans_b)
+                num_non_special_tokens = len(inputs_a["input_ids"]) + len(inputs_b["input_ids"]) - 4
 
-                input_ids = inputs_a["input_ids"] + inputs_b["input_ids"][1:]
-                token_type_ids = inputs_a["token_type_ids"] + ([1] * len(inputs_b["token_type_ids"][1:]))
-                offset = len(inputs_a["input_ids"]) - 1
+                # TODO(AW): assumption is same number of non-special tokens + sos + eos
+                #   This handles varying number of intervening tokens (e.g. different models)
+                inputs = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=max_length,)
+                num_joiner_specials = len(inputs["input_ids"]) - num_non_special_tokens - 2
+                offset = len(inputs_a["input_ids"]) - 1 + num_joiner_specials - 1
                 span_locs_b = [(s + offset, e + offset) for s, e in span_locs_b]
                 span_locs = span_locs_a + span_locs_b
+                input_ids = inputs["input_ids"]
+                token_type_ids = inputs["token_type_ids"]
 
-                tmp = tokenizer.encode_plus(example.text_a, example.text_b, add_special_tokens=True, max_length=max_length,)
-                assert tmp["input_ids"] == input_ids, "Span tracking tokenization produced inconsistent result!"
-                assert tmp["token_type_ids"] == token_type_ids, "Span tracking tokenization produced inconsistent result!"
+                if num_joiner_specials == 1:
+                    tmp = inputs_a["input_ids"] + inputs_b["input_ids"][1:]
+                elif num_joiner_specials == 2:
+                    tmp = inputs_a["input_ids"] + inputs_b["input_ids"]
+                else:
+                    assert False, "Something is wrong"
+
+                # check that the length of the input ids is expected (not necessarily the exact ids)
+                assert len(input_ids) == len(tmp), "Span tracking tokenization produced inconsistent result!"
+
             else:
                 input_ids, token_type_ids = inputs_a["input_ids"], inputs_a["token_type_ids"]
                 span_locs = span_locs_a
@@ -272,7 +284,7 @@ class BoolqProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line["idx"])
+            guid = line["idx"]
             text_a = line["passage"]
             text_b = line["question"]
             label = line["label"]
@@ -308,7 +320,8 @@ class CbProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line["idx"])
+            #guid = "%s-%s" % (set_type, line["idx"])
+            guid = line["idx"]
             text_a = line["premise"]
             text_b = line["hypothesis"]
             label = line["label"]
@@ -335,20 +348,25 @@ class CopaProcessor(DataProcessor):
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "dev.jsonl")), "dev_matched")
+        return self._create_examples(self._read_jsonl(os.path.join(data_dir, "val.jsonl")), "dev")
 
     def get_labels(self):
         """See base class."""
-        return ["entailment", "not_entailment"]
+        return [0, 1]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line[0])
-            text_a = line[1]
-            text_b = line[2]
-            label = line[-1]
+            #guid = "%s-%s" % (set_type, line["idx"])
+            guid = line["idx"]
+            label = line["label"]
+            premise = line["premise"][:-1]
+            choice1 = line["choice1"]
+            choice2 = line["choice2"]
+            joiner = "because" if line["question"] == "cause" else "so"
+            text_a = f"{premise} {joiner} {choice1}"
+            text_b = f"{premise} {joiner} {choice2}"
             examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
@@ -437,7 +455,7 @@ class RecordProcessor(DataProcessor):
             self._answers = {set_type: {}}
             data_file = "val.jsonl" if set_type == "dev" else "train.jsonl"
             data = self._read_jsonl(os.path.join(data_dir, data_file))
-            for (i, line) in enumerate(data[:10]):
+            for (i, line) in enumerate(data):
                 passage_id = line["idx"]
                 passage = line["passage"]["text"]
 
@@ -456,7 +474,7 @@ class RecordProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         qst2ans = {}
-        for (i, line) in enumerate(lines[:10]):
+        for (i, line) in enumerate(lines):
             passage_id = line["idx"]
             passage = line["passage"]["text"]
 
@@ -507,7 +525,8 @@ class RteProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line["idx"])
+            #guid = "%s-%s" % (set_type, line["idx"])
+            guid = line["idx"]
             text_a = line["premise"]
             text_b = line["hypothesis"]
             label = line["label"]
@@ -544,7 +563,8 @@ class WicProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line["idx"])
+            #guid = "%s-%s" % (set_type, line["idx"])
+            guid = line["idx"]
             text_a = line["sentence1"]
             text_b = line["sentence2"]
             span_a = (line["start1"], line["end1"])
@@ -583,7 +603,8 @@ class WscProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, line["idx"])
+            #guid = "%s-%s" % (set_type, line["idx"])
+            guid = line["idx"]
             text_a = line["text"]
             span_start1 = line["target"]["span1_index"]
             span_start2 = line["target"]["span2_index"]

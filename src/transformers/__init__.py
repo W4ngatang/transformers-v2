@@ -224,6 +224,7 @@ if is_torch_available():
         RobertaForMultipleChoice,
         RobertaForTokenClassification,
         RobertaForQuestionAnswering,
+        RobertaForSpanClassification,
         ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP,
     )
     from .modeling_camembert import (
